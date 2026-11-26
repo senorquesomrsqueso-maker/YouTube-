@@ -6,7 +6,6 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-# Respaldo opcional si instalas yt-dlp en requirements.txt
 try:
     import yt_dlp  # type: ignore
 
@@ -46,10 +45,7 @@ def parse_urls(raw_text: str) -> list[str]:
             continue
         parsed = urlparse(url)
         host = parsed.netloc.lower()
-        is_fb = (
-            parsed.scheme in ("http", "https")
-            and ("facebook.com" in host or "fb.watch" in host)
-        )
+        is_fb = parsed.scheme in ("http", "https") and ("facebook.com" in host or "fb.watch" in host)
         if is_fb and url not in seen:
             seen.add(url)
             urls.append(url)
@@ -58,7 +54,6 @@ def parse_urls(raw_text: str) -> list[str]:
 
 def normalize_fb_url(url: str) -> str:
     parsed = urlparse(url.strip())
-    # Conserva el query solo si es /watch/?v=...
     if "/watch" in parsed.path and "v=" in parsed.query:
         v_match = re.search(r"(?:^|&)v=([^&]+)", parsed.query)
         clean_query = f"v={v_match.group(1)}" if v_match else ""
@@ -96,6 +91,94 @@ def parse_metric_number(text: str | None) -> int | None:
         return None
 
 
+def extract_metrics_from_summary_text(text: str) -> dict[str, int | None]:
+    """
+    Rescata reproducciones, likes/reacciones y comentarios cuando vienen juntos
+    en cadenas tipo: '2,2 mil reproducciones · 64 reacciones · 10 comentarios'
+    """
+    out: dict[str, int | None] = {
+        "views": None,
+        "likes": None,
+        "comments": None,
+    }
+    if not text:
+        return out
+
+    m_views = re.search(
+        r"(\d+(?:[.,]\d+)?\s*(?:mil|k|m|millones|millón)?)\s*(?:reproducciones|vistas|views)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_views:
+        out["views"] = parse_metric_number(m_views.group(1))
+
+    m_likes = re.search(
+        r"(\d+(?:[.,]\d+)?\s*(?:mil|k|m|millones|millón)?)\s*(?:reacciones|me gusta|likes|reactions)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_likes:
+        out["likes"] = parse_metric_number(m_likes.group(1))
+
+    m_comments = re.search(
+        r"(\d+(?:[.,]\d+)?\s*(?:mil|k|m|millones|millón)?)\s*(?:comentarios|comments)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m_comments:
+        out["comments"] = parse_metric_number(m_comments.group(1))
+
+    return out
+
+
+def looks_like_metrics_only(text: str) -> bool:
+    t = text.strip().lower()
+    metric_keywords = ("reproducciones", "vistas", "views", "reacciones", "me gusta", "likes", "comentarios", "comments")
+    has_kw = any(k in t for k in metric_keywords)
+    has_num = re.search(r"\d", t) is not None
+    # Si la mayor parte del texto son números/palabras de métricas y no frases normales
+    stripped_metrics = re.sub(
+        r"\d+(?:[.,]\d+)?\s*(?:mil|k|m|millones|millón)?\s*(?:reproducciones|vistas|views|reacciones|me gusta|likes|comentarios|comments)?|[·•|,/-]",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    ).strip()
+    return has_kw and has_num and len(stripped_metrics) < 12
+
+
+def sanitize_creator_and_rescue_metrics(
+    creator: str | None,
+    views: int | None,
+    likes: int | None,
+    comments: int | None,
+) -> tuple[str | None, int | None, int | None, int | None]:
+    if not creator:
+        return None, views, likes, comments
+
+    rescued = extract_metrics_from_summary_text(creator)
+    if views is None and rescued["views"] is not None:
+        views = rescued["views"]
+    if likes is None and rescued["likes"] is not None:
+        likes = rescued["likes"]
+    if comments is None and rescued["comments"] is not None:
+        comments = rescued["comments"]
+
+    # Si el texto entero de creador era solo métricas (como "2,2 mil reproducciones · 64 reacciones"), limpiamos creador
+    if looks_like_metrics_only(creator):
+        return None, views, likes, comments
+
+    # Si viene separado por '·' o '|', dejamos la parte que no sea métrica como posible creador
+    for sep in ("·", "•", "|"):
+        if sep in creator:
+            partes = [p.strip() for p in creator.split(sep) if p.strip()]
+            candidatos_nombre = [p for p in partes if not looks_like_metrics_only(p)]
+            if candidatos_nombre:
+                return candidatos_nombre[0], views, likes, comments
+            return None, views, likes, comments
+
+    return creator.strip(), views, likes, comments
+
+
 def diagnose_html(html: str, final_url: str) -> str | None:
     lower = html.lower()
     if "login" in urlparse(final_url).path.lower() and "reel" not in urlparse(final_url).path.lower():
@@ -129,6 +212,13 @@ def extract_from_html(url: str, html: str, final_url: str) -> dict:
             creator = partes[0]
             title = " | ".join(partes[1:]).replace("en Facebook", "").strip()
 
+    # Rescate desde meta descripción si trae resumen de métricas
+    if desc_text:
+        desc_metrics = extract_metrics_from_summary_text(desc_text)
+        views = views if views is not None else desc_metrics["views"]
+        likes = likes if likes is not None else desc_metrics["likes"]
+        comments = comments if comments is not None else desc_metrics["comments"]
+
     patterns_views = [
         r'"video_view_count"\s*:\s*(\d+)',
         r'"play_count"\s*:\s*(\d+)',
@@ -146,7 +236,7 @@ def extract_from_html(url: str, html: str, final_url: str) -> dict:
     patterns_likes = [
         r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
         r'"like_count"\s*:\s*(\d+)',
-        r'(\d+(?:[.,]\d+)?\s*(?:mil|k|m|millones)?)\s*(?:me gusta|likes|reacciones)',
+        r'(\d+(?:[.,]\d+)?\s*(?:mil|k|m|millones)?)\s*(?:reacciones|me gusta|likes)',
     ]
     for pat in patterns_likes:
         m = re.search(pat, html, flags=re.IGNORECASE)
@@ -174,8 +264,12 @@ def extract_from_html(url: str, html: str, final_url: str) -> dict:
         if m_owner:
             creator = m_owner.group(1).encode("utf-8").decode("unicode_escape", errors="ignore").strip()
 
-    if not title and desc_text:
+    if not title and desc_text and not looks_like_metrics_only(desc_text):
         title = desc_text[:140]
+
+    creator, views, likes, comments = sanitize_creator_and_rescue_metrics(
+        creator, views, likes, comments
+    )
 
     extracted_map = {
         "Creador": creator,
@@ -238,6 +332,10 @@ def extract_with_ytdlp(url: str, cookie_header: str) -> dict | None:
         views = info.get("view_count")
         likes = info.get("like_count")
         comments = info.get("comment_count")
+
+        creator, views, likes, comments = sanitize_creator_and_rescue_metrics(
+            creator, views, likes, comments
+        )
 
         extracted_map = {
             "Creador": creator,
@@ -326,7 +424,7 @@ with st.sidebar:
         "Usar respaldo yt-dlp si falla HTTP",
         value=True,
         disabled=not HAS_YTDLP,
-        help="Requiere tener yt-dlp en requirements.txt. En la nube puede ayudar en algunos enlaces, pero no garantiza saltar bloqueos de FB.",
+        help="Requiere tener yt-dlp en requirements.txt.",
     )
     if not HAS_YTDLP:
         st.caption("Tip: agrega `yt-dlp` a `requirements.txt` si quieres activar este respaldo.")
